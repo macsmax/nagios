@@ -1,0 +1,359 @@
+#!/usr/bin/perl
+
+# check_netscaler_lbvserver 
+# 20150507 - max@last.fm
+
+use warnings;
+use strict;
+
+use Getopt::Std;
+use JSON qw( decode_json );
+use lib '/usr/local/nagios/libexec/lib/perl';
+
+my $numargv = @ARGV;
+
+sub HELP {
+  print <<EOF;
+usage: $0 -u <username> -p <password> -H <netscaler host> -V <lbvserver> [-s, -d, -S <statsd server:port>]
+        -u netscaler username
+	-p netscaler password
+	-H netscaler address
+	-s connect to the netscaler via https (http default)
+	-V lbvserver to check. This can be a comma separated list of vservers. If more than one is checked the main metrics will be aggregated. 
+	-t type of metric to check for warning and critical threshold [TBC]
+	-w warning threshold
+	-c critical threshold
+	-S statsd server [host:port]
+	-r statsd extra metric hierarchy eg. add "internal" to push metrics to stats.gauges.netscaler.internal.<lbvserver> rather than stats.gauges.netscaler.lbvserver
+
+	-d debug
+        -h Print This help message
+
+
+Available metrics for single vserver:
+
+curclntconnections - current client connections
+deferredreqrate - rate of deferred requests
+responsesrate - response rate
+requestsrate - requests rate
+pktsrecvdrate - received packets rate
+requestbytesrate - requests bytes rate
+establishedconn - number of established connections
+cursrvrconnections - current server connections
+totalpktssent - total packets sent
+totalpktsrecvd - total packets received
+tothits - total hits
+hitsrate - hits rate
+totalrequests - total requests
+totalresponses - total responses
+pktssentrate - packets sent rate
+deferredreq - number of deferred requests
+totalresponsebytes - total response bytes
+totalrequestbytes - total requests bytes
+vsvrsurgecount - virtual server surge count
+responsebytesrate - response byte rate
+totspillovers - spillovers count
+surgecount - surge count
+svcsurgecount - service surge count
+invalidrequestresponsedropped - invalid requests droped count
+inactsvcs - inactive services
+
+Aggregated metrics for multiple vservers:
+
+totalrequests - total requests
+totalresponses - total responses
+totalresponsebytes - total response bytes
+totalrequestbytes - total requests bytes
+establishedconn - number of established connections
+EOF
+    exit 1;
+}
+
+sub curlit {
+  my $apiurl = $_[0];
+  my $debug = $_[1];
+  my $json = `curl -s $apiurl`;
+  print $json . "\n" if $debug;
+  # Decode the entire JSON
+  my $decoded_json = decode_json( $json );
+  return $decoded_json;
+}
+
+# get the backends details if check is in warning or critical state
+
+sub getbackends {
+  my ( $targetvserver, $username, $password, $nshost, $http, $debug ) = @_; 
+  my $apiurl = "${http}://${username}:${password}\@${nshost}/nitro/v1/config/lbvserver";
+  $apiurl = $apiurl."?filter=name:".$targetvserver if ( $targetvserver );
+  my $lbmembersurl = "${http}://${username}:${password}\@${nshost}/nitro/v1/config/lbvserver_servicegroupmember_binding/";
+  my $decoded_json = &curlit($apiurl, $debug);
+#  $results{$lbvserver}{'lberrorcode'} = $decoded_json->{'errorcode'};
+#  $results{$lbvserver}{'lbseverity'} = $decoded_json->{'severity'};
+  my $lbvserverstats = $decoded_json->{'lbvserver'};
+  print Dumper $lbvserverstats if ( $debug );
+  my $output;
+  foreach my $lbhash (@{$lbvserverstats}){
+    print Dumper $lbhash if ($debug);
+    $output .= " IP/Port:" . $lbhash->{'ipv46'} . ":" . $lbhash->{'port'} . " - Health:[" . $lbhash->{'health'} . "%]" . " - members:[ ";
+    my $decoded_json_members = &curlit($lbmembersurl.$lbhash->{'name'}, $debug);
+    my $lbvservermembers = $decoded_json_members->{'lbvserver_servicegroupmember_binding'};
+    print Dumper $lbvservermembers if ($debug);
+    foreach my $lbmember (@{$lbvservermembers}) {
+      print Dumper $lbmember if ($debug);
+      $output .= $lbmember->{'ipv46'} . ":" . $lbmember->{'port'} . "(" . $lbmember->{'curstate'} . ") ";
+    }
+    $output .= "]";
+  }
+  return $output;
+}
+
+sub pushtostatsd {
+    my ( $debug, $statsdserver, $statsdport, %data ) = @_;
+    use Net::Statsd;
+
+    $Net::Statsd::HOST = $statsdserver;
+    $Net::Statsd::PORT = $statsdport;
+
+    print "sending the following values to: ${statsdserver}:${statsdport} \n" if ($debug);
+    eval {
+        for my $stat (keys %data) {
+            my $value = $data{$stat};
+            my $send_data = "${stat}:${value}";
+            print "$send_data\n" if ($debug);
+            Net::Statsd::gauge($stat, $value);
+
+        }
+    };
+
+}
+
+my ($username, $password, $nshost, $lbvserver, $metrictype, $warning, $critical, $statsdserver, $statsdport, $statsdextrapath, $apiurl, $output, %statsdata, $perfdata, @lbvserverarr, $decoded_json, %results);
+my $debug = 0;
+my $aggregate = 0;
+my $exitstatus = 0;
+my $dostatsd = 0;
+my $http = "http";
+
+if ( $numargv gt 0 ) {
+  getopts('hdsu:p:H:V:t:w:c:S:r:');
+  our($opt_h, $opt_d, $opt_u, $opt_p, $opt_H, $opt_V, $opt_t, $opt_w, $opt_s, $opt_c, $opt_S, $opt_r);
+  if ($opt_h) {
+    &HELP;
+  }
+  if ($opt_u) {
+    $username = $opt_u;
+  } else {
+    $username = "watch";
+  } 
+  if ($opt_p) {
+    $password = $opt_p;
+  } else {
+    $password = "watch";
+  } 
+  if ($opt_H) {
+    $nshost = $opt_H;
+  } else {
+    print "missing target netscaler host\n";
+    &HELP;
+  }
+  if ($opt_V) {
+    # check if it's a list of vservers
+    $lbvserver = $opt_V;
+    if ( $lbvserver =~ /,/ ) {
+      # remove spaces
+      $lbvserver =~ s/\s//g;
+      @lbvserverarr = split(',', $lbvserver);
+      $aggregate = 1;
+    } else {
+      $lbvserverarr[0] = $opt_V;
+    }
+  } else {
+    print "missing target lbvserver\n";
+    &HELP;
+  }
+  if ($opt_d) {
+    $debug = 1;
+    use Data::Dumper;
+  } 
+  if ($opt_t) {
+    $metrictype = $opt_t;
+    unless ( defined $opt_c || defined $opt_w ) {
+      print "Setting the metric type requires warning and critical thresholds\n";
+      &HELP;
+    }
+    $critical = $opt_c;
+    $warning = $opt_w;
+  }
+  if ( defined $opt_w || defined $opt_c ) {
+    unless ($opt_t) {
+      print "Warning and Critical thresholds require the metric type to be specified\n";
+      &HELP;
+    }
+    unless ( defined $opt_w && defined $opt_c ) {
+      print "Both Critical and Warning thresholds must be specified\n";
+      &HELP;
+    }
+  }
+  if ( $opt_s ) {
+    $http = "https";
+  }
+  if ( $opt_S ) {
+    $dostatsd = 1;
+    ( $statsdserver, $statsdport ) = split( ":", $opt_S ); 
+    #allow to pass just the statsd host and use the default statsd port
+    $statsdport ||= 8125;
+    if ( $opt_r ) {
+      if ( "a$opt_r" =~ "/a/" ) {
+        $statsdextrapath = "";
+      } else {
+        $statsdextrapath = ".".$opt_r;
+      }
+    }
+  }
+} else {
+  &HELP;
+}
+
+# iterate through the vservers and construct the results
+foreach $lbvserver (@lbvserverarr) {
+
+  $apiurl = "${http}://${username}:${password}\@${nshost}/nitro/v1/stat/lbvserver/${lbvserver}";
+  $decoded_json = &curlit($apiurl, $debug);
+  
+  $results{$lbvserver}{'lberrorcode'} = $decoded_json->{'errorcode'};
+  $results{$lbvserver}{'lbseverity'} = $decoded_json->{'severity'};
+  my $lbvserverstats = $decoded_json->{'lbvserver'}[0];
+
+  $results{$lbvserver}{'vserverstate'} = $lbvserverstats->{'state'};
+  # counters http://support.citrix.com/article/CTX133891 http://support.citrix.com/article/ctx137665
+  $results{$lbvserver}{'curclntconnections'} = $lbvserverstats->{'curclntconnections'}; # current client connections
+  $results{$lbvserver}{'vslbhealth'} = $lbvserverstats->{'vslbhealth'}; # value of 100 means that 100% of the backends are alive
+  $results{$lbvserver}{'deferredreqrate'} = $lbvserverstats->{'deferredreqrate'}; # rate of deferred requests
+  $results{$lbvserver}{'pktsrecvdrate'} = $lbvserverstats->{'pktsrecvdrate'}; # received packets rate
+  $results{$lbvserver}{'establishedconn'} = $lbvserverstats->{'establishedconn'}; # number of established connections
+  $results{$lbvserver}{'cursrvrconnections'} = $lbvserverstats->{'cursrvrconnections'}; # current server connections
+  $results{$lbvserver}{'totalpktssent'} = $lbvserverstats->{'totalpktssent'}; # total packets sent 
+  $results{$lbvserver}{'totalpktsrecvd'} = $lbvserverstats->{'totalpktsrecvd'}; # total packets received
+  $results{$lbvserver}{'tothits'} = $lbvserverstats->{'tothits'}; # total hits
+  $results{$lbvserver}{'hitsrate'} = $lbvserverstats->{'hitsrate'}; # hits rate
+  $results{$lbvserver}{'totalrequests'} = $lbvserverstats->{'totalrequests'}; # total requests
+  $results{$lbvserver}{'totalresponses'} = $lbvserverstats->{'totalresponses'}; # total responses
+  $results{$lbvserver}{'pktssentrate'} = $lbvserverstats->{'pktssentrate'}; # packets sent rate
+  $results{$lbvserver}{'deferredreq'} = $lbvserverstats->{'deferredreq'}; # number of deferred requests
+  $results{$lbvserver}{'totalresponsebytes'} = $lbvserverstats->{'totalresponsebytes'}; # total response bytes
+  $results{$lbvserver}{'totalrequestbytes'} = $lbvserverstats->{'totalrequestbytes'}; # total requests bytes
+  $results{$lbvserver}{'responsesrate'} = $lbvserverstats->{'responsesrate'}; # response rate
+  $results{$lbvserver}{'requestsrate'} = $lbvserverstats->{'requestsrate'}; # requests rate
+  $results{$lbvserver}{'responsebytesrate'} = $lbvserverstats->{'responsebytesrate'}; # response byte rate
+  $results{$lbvserver}{'requestbytesrate'} = $lbvserverstats->{'requestbytesrate'}; # requests bytes rate
+  $results{$lbvserver}{'vsvrsurgecount'} = $lbvserverstats->{'vsvrsurgecount'}; # virtual server surge count
+  $results{$lbvserver}{'totspillovers'} = $lbvserverstats->{'totspillovers'}; # spillovers count 
+  $results{$lbvserver}{'surgecount'} = $lbvserverstats->{'surgecount'}; # surge count
+  $results{$lbvserver}{'svcsurgecount'} = $lbvserverstats->{'svcsurgecount'}; # service surge count
+  $results{$lbvserver}{'invalidrequestresponsedropped'} = $lbvserverstats->{'invalidrequestresponsedropped'}; # invalid requests droped count
+  $results{$lbvserver}{'inactsvcs'} = $lbvserverstats->{'inactsvcs'}; # inactive services
+  
+
+}
+
+print Dumper %results if $debug;
+# construct aggregated perdata if we're working with multiple vservers
+if ($aggregate) {
+  my ($g_establishedconn, $g_totalrequestsrate, $g_totalresponsesrate, $g_totalresponsebytesrate, $g_totalrequestbytesrate);
+  foreach $lbvserver ( keys %results ) {
+    $g_establishedconn += $results{$lbvserver}{'establishedconn'};
+    $g_totalrequestsrate += $results{$lbvserver}{'requestsrate'};
+    $g_totalresponsesrate += $results{$lbvserver}{'responsesrate'};
+    $g_totalresponsebytesrate += $results{$lbvserver}{'responsebytesrate'};
+    $g_totalrequestbytesrate += $results{$lbvserver}{'requestbytesrate'};
+    #$g_totalrequests += $results{$lbvserver}{'totalrequests'};
+    #$g_totalresponses += $results{$lbvserver}{'totalresponses'};
+    #$g_totalresponsebytes += $results{$lbvserver}{'totalresponsebytes'};
+    #$g_totalrequestbytes += $results{$lbvserver}{'totalresponsebytes'};
+  }
+  $perfdata = "g[tot_established]=$g_establishedconn g[tot_responses]=${g_totalresponsesrate} g[tot_requests]=${g_totalrequestsrate} g[tot_response_bytes]=${g_totalresponsebytesrate}B g[tot_request_bytes]=${g_totalrequestbytesrate}B ";
+} 
+
+# iterate through the vservers and check the status
+foreach $lbvserver ( keys %results ) {
+  my $backends;
+  $output .= "- LB vserver $lbvserver: Status:$results{$lbvserver}{'vserverstate'} ";
+  if ( $results{$lbvserver}{'vserverstate'} ne "UP" ) {
+    $exitstatus = 2;
+  }
+  # above 50% warning, below 50% critical
+  if ( $results{$lbvserver}{'vslbhealth'} < "50" ) {
+    $backends = &getbackends ( $lbvserver, $username, $password, $nshost, $http, $debug ) ;
+    $output .= "- CRITICAL -> servicecount:[$results{$lbvserver}{'vslbhealth'}/100]% $backends <- CRITICAL ";
+    $exitstatus = 2;
+  } elsif ( $results{$lbvserver}{'vslbhealth'} >= "50" && $results{$lbvserver}{'vslbhealth'} < "100" ) {
+    $backends = &getbackends ( $lbvserver, $username, $password, $nshost, $http, $debug ) ;
+    $output .= "- WARNING -> servicecount:[$results{$lbvserver}{'vslbhealth'}/100]% $backends <- WARNING ";
+    $exitstatus = 1;
+  }
+  if ( $metrictype ) {
+    my $currentval = "$results{$lbvserver}{$metrictype}";
+    unless ( defined $currentval) { 
+      print "Unable to find the metric $metrictype\n";
+      &HELP;
+    }
+    if ( $currentval >= $warning && $currentval < $critical ) {
+      $output .= "- metric $metrictype is WARNING [$currentval/$warning] ";
+      if ( $exitstatus == 0 ) {
+        $exitstatus = 1;
+      }
+    } elsif ( $currentval >= $critical ) {
+      $output .= "- metric $metrictype is CRITICAL [$currentval/$critical] ";
+      $exitstatus = 2;
+    }
+  }
+  #make sure that the lbvserver name in the key doesn't contain "." for statsd metrics hierarchy
+  ( my $lbvserver_s = $lbvserver ) =~ s/\./_/g;
+  no warnings 'uninitialized';
+  $perfdata .= "g[${lbvserver}_establishedconn]=$results{$lbvserver}{'establishedconn'} ";
+  $statsdata{"netscaler${statsdextrapath}.${lbvserver_s}.lb_established"} = "$results{$lbvserver}{'establishedconn'}";
+  $perfdata .= "g[${lbvserver}_requestsrate]=$results{$lbvserver}{'requestsrate'} ";
+  $statsdata{"netscaler${statsdextrapath}.${lbvserver_s}.lb_requestsrate"} = "$results{$lbvserver}{'requestsrate'}";
+  $perfdata .= "g[${lbvserver}_responsesrate]=$results{$lbvserver}{'responsesrate'} ";
+  $statsdata{"netscaler${statsdextrapath}.${lbvserver_s}.lb_responsesrate"} = "$results{$lbvserver}{'responsesrate'}";
+  $perfdata .= "g[${lbvserver}_responsebytesrate]=$results{$lbvserver}{'responsebytesrate'}B ";
+  $statsdata{"netscaler${statsdextrapath}.${lbvserver_s}.bytes_responserate"} = "$results{$lbvserver}{'responsebytesrate'}";
+  $perfdata .= "g[${lbvserver}_requestbytesrate]=$results{$lbvserver}{'requestbytesrate'}B ";
+  $statsdata{"netscaler${statsdextrapath}.${lbvserver_s}.bytes_requestrate"} = "$results{$lbvserver}{'requestbytesrate'}";
+  $perfdata .= "g[${lbvserver}_surgecount]=$results{$lbvserver}{'surgecount'} ";
+  $statsdata{"netscaler${statsdextrapath}.${lbvserver_s}.lb_surgecount"} = "$results{$lbvserver}{'surgecount'}";
+  $perfdata .= "g[${lbvserver}_curclntconnections]=$results{$lbvserver}{'curclntconnections'} ";
+  $statsdata{"netscaler${statsdextrapath}.${lbvserver_s}.lb_curclntconnections"} = "$results{$lbvserver}{'curclntconnections'}";
+  $perfdata .= "g[${lbvserver}_cursrvrconnections]=$results{$lbvserver}{'cursrvrconnections'} ";
+  $statsdata{"netscaler${statsdextrapath}.${lbvserver_s}.lb_cursrvrconnections"} = "$results{$lbvserver}{'cursrvrconnections'}";
+  
+#not used stats. 
+  #$perfdata .= "d[${lbvserver}_totalrequests]=$results{$lbvserver}{'totalrequests'}c ";
+  #$perfdata .= "d[${lbvserver}_totalrequestbytes]=$results{$lbvserver}{'totalrequestbytes'}B ";
+  #$perfdata .= "d[${lbvserver}_totalresponsebytes]=$results{$lbvserver}{'totalresponsebytes'}B ";
+  #$perfdata .= "${lbvserver}_pktsrecvdrate=$results{$lbvserver}{'pktsrecvdrate'} ";
+  #$perfdata .= "${lbvserver}_totalpktssent=$results{$lbvserver}{'totalpktssent'}c ";
+  #$perfdata .= "${lbvserver}_totalpktsrecvd=$results{$lbvserver}{'totalpktsrecvd'}c ";
+  #$perfdata .= "${lbvserver}_tothits=$results{$lbvserver}{'tothits'} ";
+  #$perfdata .= "${lbvserver}_hitsrate=$results{$lbvserver}{'hitsrate'} ";
+  #$perfdata .= "${lbvserver}_pktssentrate=$results{$lbvserver}{'pktssentrate'} ";
+  #$perfdata .= "${lbvserver}_deferredreq=$results{$lbvserver}{'deferredreq'} ";
+  #$perfdata .= "${lbvserver}_vsvrsurgecount=$results{$lbvserver}{'vsvrsurgecount'} ";
+  #$perfdata .= "${lbvserver}_totspillovers=$results{$lbvserver}{'totspillovers'}c ";
+  #$perfdata .= "${lbvserver}_svcsurgecount=$results{$lbvserver}{'svcsurgecount'} ";
+  #$perfdata .= "${lbvserver}_invalidrequestresponsedropped=$results{$lbvserver}{'invalidrequestresponsedropped'} ";
+}
+
+#push to statsd
+&pushtostatsd($debug, $statsdserver, $statsdport, %statsdata) if ($dostatsd);
+
+print "LBVserver ";
+print "CRITICAL " if ( $exitstatus == 2 );
+print "OK " if ( $exitstatus == 0 );
+print "WARNING " if ($exitstatus == 1 );
+print "UNKNOWN " if ($exitstatus > 2);
+
+
+print $output;
+print " | " . $perfdata . "\n";
+exit $exitstatus;

@@ -11,7 +11,7 @@ Multiple vservers can be specified as comma separated value. This will aggregate
 Requires: JSON, Net::Statsd (if you choose to use the statsd option)
 
 Help:
-`
+```
 $ ./check_netscaler_lbvserver -h
 usage: ./check_netscaler_lbvserver -u <username> -p <password> -H <netscaler host> -V <lbvserver> [-s, -d, -S <statsd server:port>]
         -u netscaler username
@@ -64,10 +64,10 @@ totalresponses - total responses
 totalresponsebytes - total response bytes
 totalrequestbytes - total requests bytes
 establishedconn - number of established connections
-`
+```
 
 Example:
-`
+```
 $ ./check_netscaler_lbvserver -H my-netscaler.com -V  www-kafka
 LBVserver OK - LB vserver www-kafka: Status:UP  | g[www-kafka_establishedconn]=0 g[www-kafka_requestsrate]=0 g[www-kafka_responsesrate]=0 g[www-kafka_responsebytesrate]=0B g[www-kafka_requestbytesrate]=0B g[www-kafka_surgecount]=0 g[www-kafka_curclntconnections]=0 g[www-kafka_cursrvrconnections]=0
 
@@ -79,4 +79,4 @@ LBVserver WARNING - LB vserver www-test: Status:UP - WARNING -> servicecount:[50
 
 $ echo $?
 1
-`
+```

@@ -4,11 +4,15 @@ various nagios/centreon related scripts
 ## Plugins
 
 ### check_netscaler_lbvserver
-This nagios plugin will query the Citrix Netscaler nitro API for given vservers.
+This nagios plugin is a perl script that will query the Citrix Netscaler nitro API for given vservers.
+
 It will return a warning exit code and output if the total backends are <=50% and critical thereafter.
+
 The script will create perfdata on it's output and has the option to push the data to statsd, this will enable graphing of data through graphite or statsd driven graphing tools.
+
 Multiple vservers can be specified as comma separated value. This will aggregate metrics.
-Requires: JSON, Net::Statsd (if you choose to use the statsd option)
+
+Requires: Perl, JSON, Net::Statsd (if you choose to use the statsd option)
 
 Help:
 ```
